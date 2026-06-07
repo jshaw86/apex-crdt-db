@@ -1,0 +1,32 @@
+services:
+  # Node 1 is the primary node and holds the network namespace for all nodes.
+  # Since all nodes share this container's network namespace (127.0.0.1),
+  # we expose/publish all ports on this container.
+  node1:
+    build: .
+    container_name: db_node1
+    command: ["9000", "1"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+      - "9002:9002"
+
+  # Node 2 connects to Node 1 (port 9000) as its seed.
+  # Shares the network stack of node1 (network_mode: "service:node1").
+  node2:
+    build: .
+    container_name: db_node2
+    command: ["9001", "2", "9000"]
+    network_mode: "service:node1"
+    depends_on:
+      - node1
+
+  # Node 3 connects to Node 1 (port 9000) as its seed.
+  # Shares the network stack of node1 (network_mode: "service:node1").
+  node3:
+    build: .
+    container_name: db_node3
+    command: ["9002", "3", "9000"]
+    network_mode: "service:node1"
+    depends_on:
+      - node1

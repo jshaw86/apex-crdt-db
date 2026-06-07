@@ -1,0 +1,6 @@
+.zig-cache/
+zig-out/
+*.o
+*.obj
+.DS_Store
+*.log

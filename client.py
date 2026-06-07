@@ -19,21 +19,21 @@ OP_SET_ADD = 0x03
 OP_SET_REMOVE = 0x04
 
 def print_usage():
-    print("Apex CRDT Database CLI Client Utility")
+    print("Apex Database CLI Client Utility")
     print("Usage:")
     print("  python3 client.py schema <port> <table_id> <sql>")
-    print("  python3 client.py mutate <port> <table_id> <pk> <col_idx> <type> <val>")
+    print("  python3 client.py mutate <port> <table_id> <pk> <col_idx> <op> <val>")
     print("  python3 client.py query <port> <table_id> <pk>")
-    print("\nMutation Types:")
-    print("  lww         - Last-Write-Wins Register (sets string value)")
-    print("  pn          - Positive-Negative Counter (adds integer increment)")
-    print("  set-add     - Add-Wins Set (adds element to set)")
-    print("  set-remove  - Add-Wins Set (removes element from set)")
+    print("\nOperations:")
+    print("  set          - Set text value (for TEXT fields)")
+    print("  add          - Add integer increment (for INT fields)")
+    print("  add-item     - Add element to set (for SET fields)")
+    print("  remove-item  - Remove element from set (for SET fields)")
     print("\nExamples:")
     print('  python3 client.py schema 9000 10 "CREATE TABLE users { name: TEXT, karma: INT, friends: SET }"')
-    print('  python3 client.py mutate 9000 10 bob1 0 lww "Bob Smith"')
-    print('  python3 client.py mutate 9000 10 bob1 1 pn 100')
-    print('  python3 client.py mutate 9000 10 bob1 2 set-add Alice')
+    print('  python3 client.py mutate 9000 10 bob1 0 set "Bob Smith"')
+    print('  python3 client.py mutate 9000 10 bob1 1 add 100')
+    print('  python3 client.py mutate 9000 10 bob1 2 add-item Alice')
     print('  python3 client.py query 9000 10 bob1')
 
 def read_all(sock, n):
@@ -107,7 +107,15 @@ def parse_query_response(payload):
             else:
                 val_decoded = val_bytes.decode("utf-8", errors="replace")
                 
-            print(f"  Col {c}: (type={col_type}) val='{val_decoded}'")
+            type_str = "UNKNOWN"
+            if col_type == 1:
+                type_str = "TEXT"
+            elif col_type == 2:
+                type_str = "INT"
+            elif col_type == 3:
+                type_str = "SET"
+                
+            print(f"  Col {c}: (type={type_str}) val='{val_decoded}'")
 
 def main():
     if len(sys.argv) < 2:
@@ -134,20 +142,20 @@ def main():
         port, table_id, pk, col_idx, mut_type, val = sys.argv[2:8]
         
         mut_type = mut_type.lower()
-        if mut_type == "lww":
+        if mut_type == "set":
             op_code = OP_LWW_SET
             val_bytes = val.encode("utf-8")
-        elif mut_type == "pn":
+        elif mut_type == "add":
             op_code = OP_PN_ADD
             val_bytes = struct.pack("<q", int(val))
-        elif mut_type == "set-add":
+        elif mut_type == "add-item":
             op_code = OP_SET_ADD
             val_bytes = val.encode("utf-8")
-        elif mut_type == "set-remove":
+        elif mut_type == "remove-item":
             op_code = OP_SET_REMOVE
             val_bytes = val.encode("utf-8")
         else:
-            print(f"Error: Unknown mutation type '{mut_type}'")
+            print(f"Error: Unknown operation type '{mut_type}'")
             print_usage()
             sys.exit(1)
             

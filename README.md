@@ -109,18 +109,18 @@ You can then run the following verification sequence:
    ```
 
 2. **Send Mutations (Writes) to Node 1**:
-   - Write to the LWW Register (`name`, Column 0):
+   - Write to the TEXT column (`name`, Column 0):
      ```bash
-     python3 client.py mutate 9000 10 bob1 0 lww "Bob Smith"
+     python3 client.py mutate 9000 10 bob1 0 set "Bob Smith"
      ```
-   - Increment the PN Counter (`karma`, Column 1):
+   - Increment the INT counter (`karma`, Column 1):
      ```bash
-     python3 client.py mutate 9000 10 bob1 1 pn 150
+     python3 client.py mutate 9000 10 bob1 1 add 150
      ```
-   - Add items to the Add-Wins Set (`friends`, Column 2):
+   - Add items to the SET column (`friends`, Column 2):
      ```bash
-     python3 client.py mutate 9000 10 bob1 2 set-add Alice
-     python3 client.py mutate 9000 10 bob1 2 set-add Charlie
+     python3 client.py mutate 9000 10 bob1 2 add-item Alice
+     python3 client.py mutate 9000 10 bob1 2 add-item Charlie
      ```
 
 3. **Query Node 1 to verify local write state**:

@@ -20,11 +20,11 @@ pub const ReplicationManager = struct {
 
     fn runSyncLoop(self: *ReplicationManager) void {
         while (true) {
-            std.time.sleep(5 * std.time.ns_per_s); // Sync every 5 seconds
+            std.Io.sleep(self.db.io, std.Io.Duration.fromSeconds(5), .awake) catch {};
 
             const peers_count = blk: {
-                self.db.peers_mutex.lock();
-                defer self.db.peers_mutex.unlock();
+                self.db.peers_mutex.lockUncancelable(self.db.io);
+                defer self.db.peers_mutex.unlock(self.db.io);
                 break :blk self.db.peers.count();
             };
             if (peers_count == 0) continue;
@@ -44,10 +44,10 @@ pub const ReplicationManager = struct {
         // For now, we'll implement "Push Delta": Send all mutations from our oplog
         // that have a timestamp newer than 5 seconds ago.
         
-        const now = std.time.milliTimestamp();
-        var payload = std.ArrayList(u8).init(self.allocator);
-        defer payload.deinit();
-        const writer = payload.writer();
+        const now = std.Io.Clock.now(.real, self.db.io).toMilliseconds();
+        var aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
 
         var delta_count: u32 = 0;
         for (self.db.oplog.items) |m| {
@@ -68,18 +68,19 @@ pub const ReplicationManager = struct {
 
         if (delta_count == 0) return;
 
+        const written_payload = aw.written();
         const header = protocol.Header{
             .msg_type = .sync,
             .stream_id = 0,
-            .payload_len = @intCast(payload.items.len),
+            .payload_len = @intCast(written_payload.len),
             .sequence = 0,
         };
 
-        var target_peers = std.ArrayList(db_mod.Peer).init(self.allocator);
+        var target_peers = std.array_list.Managed(db_mod.Peer).init(self.allocator);
         defer target_peers.deinit();
         {
-            self.db.peers_mutex.lock();
-            defer self.db.peers_mutex.unlock();
+            self.db.peers_mutex.lockUncancelable(self.db.io);
+            defer self.db.peers_mutex.unlock(self.db.io);
             var it = self.db.peers.valueIterator();
             while (it.next()) |peer| {
                 try target_peers.append(peer.*);
@@ -87,10 +88,14 @@ pub const ReplicationManager = struct {
         }
 
         for (target_peers.items) |peer| {
-            const stream = std.net.tcpConnectToAddress(peer.address) catch continue;
-            defer stream.close();
-            try stream.writer().writeAll(std.mem.asBytes(&header));
-            try stream.writer().writeAll(payload.items);
+            const stream = std.Io.net.IpAddress.connect(&peer.address, self.db.io, .{ .mode = .stream }) catch continue;
+            defer stream.close(self.db.io);
+            var write_buf: [1024]u8 = undefined;
+            var conn_writer = stream.writer(self.db.io, &write_buf);
+            const conn_w = &conn_writer.interface;
+            try conn_w.writeAll(std.mem.asBytes(&header));
+            try conn_w.writeAll(written_payload);
+            try conn_w.flush();
             std.debug.print("Pushed {} deltas to peer {}\n", .{delta_count, peer.address});
         }
     }

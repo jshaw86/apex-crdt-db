@@ -17,24 +17,26 @@ pub const Database = struct {
     allocator: std.mem.Allocator,
     node_id: u32,
     peers: std.AutoHashMap(u32, Peer),
-    peers_mutex: std.Thread.Mutex,
+    peers_mutex: std.Io.Mutex,
+    io: std.Io,
     
     // Version Vector: NodeID -> Highest Sequence seen
     version_vector: std.AutoHashMap(u32, u64),
     // Oplog: A history of mutations for delta sync
-    oplog: std.ArrayList(Mutation),
+    oplog: std.array_list.Managed(Mutation),
     next_seq: u64 = 1,
 
-    pub fn init(allocator: std.mem.Allocator, node_id: u32) Database {
+    pub fn init(allocator: std.mem.Allocator, node_id: u32, io: std.Io) Database {
         return .{
             .tables = std.StringHashMap(*engine.Table).init(allocator),
             .schema_registry = schema_mod.SchemaRegistry.init(allocator),
             .allocator = allocator,
             .node_id = node_id,
             .peers = std.AutoHashMap(u32, Peer).init(allocator),
-            .peers_mutex = .{},
+            .peers_mutex = .init,
             .version_vector = std.AutoHashMap(u32, u64).init(allocator),
-            .oplog = std.ArrayList(Mutation).init(allocator),
+            .oplog = std.array_list.Managed(Mutation).init(allocator),
+            .io = io,
         };
     }
 
@@ -55,10 +57,10 @@ pub const Database = struct {
         self.oplog.deinit();
     }
 
-    pub fn addOrUpdatePeer(self: *Database, id: u32, address: std.net.Address) !void {
+    pub fn addOrUpdatePeer(self: *Database, id: u32, address: std.Io.net.IpAddress) !void {
         if (id == self.node_id) return;
-        self.peers_mutex.lock();
-        defer self.peers_mutex.unlock();
+        self.peers_mutex.lockUncancelable(self.io);
+        defer self.peers_mutex.unlock(self.io);
 
         // Check if there is an existing entry for this port with a different ID (e.g. placeholder ID 0)
         var it = self.peers.iterator();
@@ -77,7 +79,7 @@ pub const Database = struct {
         try self.peers.put(id, .{
             .id = id,
             .address = address,
-            .last_seen = std.time.milliTimestamp(),
+            .last_seen = std.Io.Clock.now(.real, self.io).toMilliseconds(),
         });
     }
 
@@ -94,11 +96,10 @@ pub const Database = struct {
     /// Process a binary mutation payload.
     /// Format: [TableID: u16][TTL: u32][PK_Len: u16][PK: Bytes][MutationCount: u8]
     pub fn processMutation(self: *Database, payload: []const u8, is_sync: bool) !void {
-        var fbs = std.io.fixedBufferStream(payload);
-        const reader = fbs.reader();
+        var reader = std.Io.Reader.fixed(payload);
 
-        while (fbs.pos < payload.len) {
-            const table_id = reader.readInt(u16, .little) catch break;
+        while (reader.seek < reader.end) {
+            const table_id = reader.takeInt(u16, .little) catch break;
             const ttl_seconds: u32 = 0;
             
             const schema = self.schema_registry.getById(table_id) orelse {
@@ -107,9 +108,9 @@ pub const Database = struct {
             };
             const table = self.tables.get(schema.name) orelse return error.TableNotFound;
 
-            const pk_len = try reader.readInt(u16, .little);
-            const pk = payload[fbs.pos .. fbs.pos + pk_len];
-            try fbs.seekBy(@intCast(pk_len));
+            const pk_len = try reader.takeInt(u16, .little);
+            const pk = payload[reader.seek .. reader.seek + pk_len];
+            try reader.discardAll(@intCast(pk_len));
 
             const row = try table.getOrCreateRow(pk);
             
@@ -118,29 +119,29 @@ pub const Database = struct {
                 row.expires_at = std.time.milliTimestamp() + (@as(i64, ttl_seconds) * 1000);
             }
 
-            const mutation_count = try reader.readByte();
+            const mutation_count = try reader.takeInt(u8, .little);
             var i: u8 = 0;
             while (i < mutation_count) : (i += 1) {
-                const col_idx = try reader.readByte();
-                const op = try reader.readByte();
+                const col_idx = try reader.takeInt(u8, .little);
+                const op = try reader.takeInt(u8, .little);
 
                 if (col_idx >= schema.columns.items.len) return error.ColumnOutOfRange;
                 const col_def = schema.columns.items[col_idx];
 
                 var meta: engine.LwwMetadata = undefined;
                 if (is_sync) {
-                    meta.timestamp = try reader.readInt(i64, .little);
-                    meta.node_id = try reader.readInt(u32, .little);
+                    meta.timestamp = try reader.takeInt(i64, .little);
+                    meta.node_id = try reader.takeInt(u32, .little);
                 } else {
                     meta = .{
-                        .timestamp = std.time.milliTimestamp(),
+                        .timestamp = std.Io.Clock.now(.real, self.io).toMilliseconds(),
                         .node_id = self.node_id,
                     };
                 }
 
-                const val_len = try reader.readInt(u16, .little);
-                const val = payload[fbs.pos .. fbs.pos + val_len];
-                try fbs.seekBy(@intCast(val_len));
+                const val_len = try reader.takeInt(u16, .little);
+                const val = payload[reader.seek .. reader.seek + val_len];
+                try reader.discardAll(@intCast(val_len));
 
                 // CRDT Merge
                 const cell = try self.ensureCell(row, col_idx, col_def.crdt_type);
@@ -181,7 +182,7 @@ pub const Database = struct {
                 },
                 .aw_set => .{
                     .aw_set = .{
-                        .elements = std.StringHashMap(std.ArrayList(engine.LwwMetadata)).init(self.allocator),
+                        .elements = std.StringHashMap(std.array_list.Managed(engine.LwwMetadata)).init(self.allocator),
                     },
                 },
             };
@@ -194,18 +195,19 @@ pub const Database = struct {
     /// Request Format: [TableID: u16][PK_Len: u16][PK: Bytes]
     ///   If PK_Len is 0, performs a full TABLE SCAN.
     pub fn processQuery(self: *Database, payload: []const u8, out_buffer: *std.ArrayList(u8)) !void {
-        var fbs = std.io.fixedBufferStream(payload);
-        const reader = fbs.reader();
-        const writer = out_buffer.writer();
+        var reader = std.Io.Reader.fixed(payload);
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, out_buffer);
+        defer out_buffer.* = aw.toArrayList();
+        const writer = &aw.writer;
 
-        const table_id = try reader.readInt(u16, .little);
+        const table_id = try reader.takeInt(u16, .little);
         const schema = self.schema_registry.getById(table_id) orelse {
             try writer.writeByte(0x01); // Status: Not Found
             return;
         };
         const table = self.tables.get(schema.name) orelse return error.TableNotFound;
 
-        const pk_len = try reader.readInt(u16, .little);
+        const pk_len = try reader.takeInt(u16, .little);
         
         if (pk_len == 0) {
             // --- TABLE SCAN (SELECT *) ---
@@ -228,7 +230,7 @@ pub const Database = struct {
             }
         } else {
             // --- POINT LOOKUP ---
-            const pk = payload[fbs.pos .. fbs.pos + pk_len];
+            const pk = payload[reader.seek .. reader.seek + pk_len];
             if (table.rows.get(pk)) |row| {
                 try writer.writeByte(0x00); // Status: OK
                 try writer.writeInt(u32, 1, .little); // Returning 1 row
@@ -251,7 +253,9 @@ pub const Database = struct {
     pub fn serializeSync(self: *Database, table_name: []const u8, out_buffer: *std.ArrayList(u8)) !void {
         const table = self.tables.get(table_name) orelse return error.TableNotFound;
         const schema = self.schema_registry.getByName(table_name) orelse return error.SchemaNotFound;
-        const writer = out_buffer.writer();
+        var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, out_buffer);
+        defer out_buffer.* = aw.toArrayList();
+        const writer = &aw.writer;
 
         try writer.writeInt(u16, schema.id, .little);
 
@@ -304,6 +308,6 @@ pub const Database = struct {
 
 pub const Peer = struct {
     id: u32,
-    address: std.net.Address,
+    address: std.Io.net.IpAddress,
     last_seen: i64,
 };

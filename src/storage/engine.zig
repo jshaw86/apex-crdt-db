@@ -34,7 +34,7 @@ pub const Cell = union(CrdtType) {
     },
     aw_set: struct {
         // Map of value -> set of (timestamp, node_id) "dots"
-        elements: std.StringHashMap(std.ArrayList(LwwMetadata)),
+        elements: std.StringHashMap(std.array_list.Managed(LwwMetadata)),
     },
 
     pub fn deinit(self: *Cell, allocator: std.mem.Allocator) void {
@@ -93,7 +93,7 @@ pub const Cell = union(CrdtType) {
                     var entry = try set.elements.getOrPut(val);
                     if (!entry.found_existing) {
                         entry.key_ptr.* = try allocator.dupe(u8, val);
-                        entry.value_ptr.* = std.ArrayList(LwwMetadata).init(allocator);
+                        entry.value_ptr.* = std.array_list.Managed(LwwMetadata).init(allocator);
                     } else {
                         // Check for duplicate dot
                         for (entry.value_ptr.items) |dot| {
@@ -127,7 +127,7 @@ pub const Cell = union(CrdtType) {
                 return std.fmt.allocPrint(allocator, "{}", .{total});
             },
             .aw_set => |set| {
-                var list = std.ArrayList(u8).init(allocator);
+                var list = std.array_list.Managed(u8).init(allocator);
                 try list.appendSlice("[");
                 var it = set.elements.keyIterator();
                 var first = true;
@@ -145,7 +145,7 @@ pub const Cell = union(CrdtType) {
 
 pub const Row = struct {
     pk: []u8,
-    cells: std.ArrayList(Cell),
+    cells: std.array_list.Managed(Cell),
     expires_at: ?i64 = null,
 
     pub fn deinit(self: *Row, allocator: std.mem.Allocator) void {
@@ -187,7 +187,7 @@ pub const Table = struct {
 
         row.* = .{
             .pk = try self.allocator.dupe(u8, pk),
-            .cells = std.ArrayList(Cell).init(self.allocator),
+            .cells = std.array_list.Managed(Cell).init(self.allocator),
         };
 
         try self.rows.put(row.pk, row);
@@ -271,7 +271,7 @@ test "AW Set CRDT" {
     const allocator = std.testing.allocator;
     var aw_cell = Cell{
         .aw_set = .{
-            .elements = std.StringHashMap(std.ArrayList(LwwMetadata)).init(allocator),
+            .elements = std.StringHashMap(std.array_list.Managed(LwwMetadata)).init(allocator),
         },
     };
     defer aw_cell.deinit(allocator);

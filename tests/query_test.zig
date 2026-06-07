@@ -1,29 +1,36 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const protocol = @import("protocol");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
     defer _ = gpa.deinit();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    const io = init.io;
+
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip binary name
 
     const port = if (args.next()) |p| try std.fmt.parseInt(u16, p, 10) else 9000;
-    const address = try net.Address.resolveIp("127.0.0.1", port);
-    const stream = try net.tcpConnectToAddress(address);
-    defer stream.close();
+    const address = try net.IpAddress.parse("127.0.0.1", port);
+    const stream = try net.IpAddress.connect(&address, io, .{ .mode = .stream });
+    defer stream.close(io);
 
-    const writer = stream.writer();
-    const reader = stream.reader();
+    var write_buf: [1024]u8 = undefined;
+    var conn_writer = stream.writer(io, &write_buf);
+    const writer = &conn_writer.interface;
+
+    var read_buf: [1024]u8 = undefined;
+    var conn_reader = stream.reader(io, &read_buf);
+    const reader = &conn_reader.interface;
 
     // 1. Send a Query for PK "user" in Table 5
-    var payload_buf = std.ArrayList(u8).init(allocator);
-    defer payload_buf.deinit();
+    var aw = std.Io.Writer.Allocating.init(allocator);
+    defer aw.deinit();
 
-    const p_writer = payload_buf.writer();
+    const p_writer = &aw.writer;
     try p_writer.writeInt(u16, 5, .little);
     try p_writer.writeInt(u16, 4, .little);
     try p_writer.writeAll("user");
@@ -31,16 +38,18 @@ pub fn main() !void {
     const header = protocol.Header{
         .msg_type = .query,
         .stream_id = 42,
-        .payload_len = @intCast(payload_buf.items.len),
+        .payload_len = @intCast(aw.written().len),
         .sequence = 1,
     };
 
     try writer.writeAll(std.mem.asBytes(&header));
-    try writer.writeAll(payload_buf.items);
+    try writer.writeAll(aw.written());
+    try writer.flush();
 
     // 2. Read the Response
     var resp_header_buf: [protocol.Header.SIZE]u8 = undefined;
-    _ = try reader.readAtLeast(&resp_header_buf, protocol.Header.SIZE);
+    const bytes_read = try reader.readSliceShort(&resp_header_buf);
+    if (bytes_read < protocol.Header.SIZE) return error.InvalidProtocol;
     const resp_header = std.mem.bytesToValue(protocol.Header, &resp_header_buf);
 
     if (resp_header.msg_type != .query_response) {
@@ -50,7 +59,7 @@ pub fn main() !void {
 
     const resp_payload = try allocator.alloc(u8, resp_header.payload_len);
     defer allocator.free(resp_payload);
-    _ = try reader.readAtLeast(resp_payload, resp_header.payload_len);
+    try reader.readSliceAll(resp_payload);
 
     // 3. Parse Response [Status: u8][RowCount: u32]
     if (resp_payload[0] == 0x01) {

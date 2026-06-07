@@ -20,19 +20,19 @@ pub const GossipManager = struct {
     }
 
     fn runGossipLoop(self: *GossipManager) void {
-        var prng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Clock.now(.real, self.db.io).toMilliseconds()));
         const random = prng.random();
 
         while (true) {
-            std.time.sleep(2 * std.time.ns_per_s); // Gossip every 2 seconds
+            std.Io.sleep(self.db.io, std.Io.Duration.fromSeconds(2), .awake) catch {};
 
             // 1. Check for dead peers
             self.checkHealth();
 
             // 2. Pick a random peer to gossip with
             const target = blk: {
-                self.db.peers_mutex.lock();
-                defer self.db.peers_mutex.unlock();
+                self.db.peers_mutex.lockUncancelable(self.db.io);
+                defer self.db.peers_mutex.unlock(self.db.io);
                 const peers_count = self.db.peers.count();
                 if (peers_count == 0) break :blk null;
 
@@ -53,15 +53,15 @@ pub const GossipManager = struct {
     }
 
     fn checkHealth(self: *GossipManager) void {
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.now(.real, self.db.io).toMilliseconds();
         const timeout = 10 * 1000; // 10 seconds of inactivity = dead
 
-        var to_remove = std.ArrayList(u32).init(self.allocator);
+        var to_remove = std.array_list.Managed(u32).init(self.allocator);
         defer to_remove.deinit();
 
         {
-            self.db.peers_mutex.lock();
-            defer self.db.peers_mutex.unlock();
+            self.db.peers_mutex.lockUncancelable(self.db.io);
+            defer self.db.peers_mutex.unlock(self.db.io);
             var it = self.db.peers.iterator();
             while (it.next()) |entry| {
                 const peer = entry.value_ptr.*;
@@ -72,8 +72,8 @@ pub const GossipManager = struct {
         }
 
         if (to_remove.items.len > 0) {
-            self.db.peers_mutex.lock();
-            defer self.db.peers_mutex.unlock();
+            self.db.peers_mutex.lockUncancelable(self.db.io);
+            defer self.db.peers_mutex.unlock(self.db.io);
             for (to_remove.items) |id| {
                 if (self.db.peers.get(id)) |peer| {
                     std.debug.print("Node {} (addr={}) timed out. Removing from cluster.\n", .{ peer.id, peer.address });
@@ -84,9 +84,9 @@ pub const GossipManager = struct {
     }
 
     fn gossipWith(self: *GossipManager, target: db_mod.Peer) !void {
-        var payload = std.ArrayList(u8).init(self.allocator);
-        defer payload.deinit();
-        const writer = payload.writer();
+        var aw = std.Io.Writer.Allocating.init(self.allocator);
+        defer aw.deinit();
+        const writer = &aw.writer;
 
         // 1. Include myself in the gossip list
         try writer.writeInt(u32, self.db.node_id, .little);
@@ -94,8 +94,8 @@ pub const GossipManager = struct {
 
         // 2. Include other known peers (limit to 5 to keep packet small)
         {
-            self.db.peers_mutex.lock();
-            defer self.db.peers_mutex.unlock();
+            self.db.peers_mutex.lockUncancelable(self.db.io);
+            defer self.db.peers_mutex.unlock(self.db.io);
             var it = self.db.peers.valueIterator();
             var count: usize = 0;
             while (it.next()) |peer| {
@@ -110,34 +110,38 @@ pub const GossipManager = struct {
             }
         }
 
+        const written_payload = aw.written();
         const header = protocol.Header{
             .msg_type = .gossip,
             .stream_id = 0,
-            .payload_len = @intCast(payload.items.len),
+            .payload_len = @intCast(written_payload.len),
             .sequence = 0,
         };
 
-        const stream = std.net.tcpConnectToAddress(target.address) catch |err| {
-            std.debug.print("Node {} gossip: tcpConnectToAddress to {} failed: {}\n", .{self.db.node_id, target.address, err});
+        const stream = std.Io.net.IpAddress.connect(&target.address, self.db.io, .{ .mode = .stream }) catch |err| {
+            std.debug.print("Node {} gossip: connect to {} failed: {}\n", .{self.db.node_id, target.address, err});
             return;
         };
-        defer stream.close();
+        defer stream.close(self.db.io);
 
-        try stream.writer().writeAll(std.mem.asBytes(&header));
-        try stream.writer().writeAll(payload.items);
+        var write_buf: [1024]u8 = undefined;
+        var conn_writer = stream.writer(self.db.io, &write_buf);
+        const conn_w = &conn_writer.interface;
+        try conn_w.writeAll(std.mem.asBytes(&header));
+        try conn_w.writeAll(written_payload);
+        try conn_w.flush();
         std.debug.print("Node {} sent gossip to node {} ({})\n", .{self.db.node_id, target.id, target.address});
     }
 
     pub fn handleGossip(self: *GossipManager, payload: []const u8) !void {
-        var fbs = std.io.fixedBufferStream(payload);
-        const reader = fbs.reader();
+        var reader = std.Io.Reader.fixed(payload);
 
-        while (fbs.pos < payload.len) {
-            const id = try reader.readInt(u32, .little);
-            const port = try reader.readInt(u16, .little);
+        while (reader.seek < reader.end) {
+            const id = try reader.takeInt(u32, .little);
+            const port = try reader.takeInt(u16, .little);
             
             if (id != self.db.node_id) {
-                const addr = try std.net.Address.resolveIp("127.0.0.1", port);
+                const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
                 std.debug.print("Node {} received gossip: peer {} at port {}\n", .{self.db.node_id, id, port});
                 try self.db.addOrUpdatePeer(id, addr);
             }

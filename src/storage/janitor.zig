@@ -14,7 +14,7 @@ pub const Janitor = struct {
 
     fn runJanitorLoop(self: *Janitor) void {
         while (true) {
-            std.time.sleep(10 * std.time.ns_per_s); // Sweep every 10 seconds
+            std.Io.sleep(self.db.io, std.Io.Duration.fromSeconds(10), .awake) catch {};
             self.sweep() catch |err| {
                 std.debug.print("Janitor sweep error: {}\n", .{err});
             };
@@ -22,7 +22,7 @@ pub const Janitor = struct {
     }
 
     fn sweep(self: *Janitor) !void {
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Clock.now(.real, self.db.io).toMilliseconds();
         var table_it = self.db.tables.valueIterator();
         
         while (table_it.next()) |table_ptr| {

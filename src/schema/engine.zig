@@ -13,13 +13,13 @@ pub const ColumnDefinition = struct {
 pub const TableSchema = struct {
     id: u16,
     name: []const u8,
-    columns: std.ArrayList(ColumnDefinition),
+    columns: std.array_list.Managed(ColumnDefinition),
 
     pub fn init(allocator: std.mem.Allocator, id: u16, name: []const u8) TableSchema {
         return .{
             .id = id,
             .name = name,
-            .columns = std.ArrayList(ColumnDefinition).init(allocator),
+            .columns = std.array_list.Managed(ColumnDefinition).init(allocator),
         };
     }
 

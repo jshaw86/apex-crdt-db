@@ -1,28 +1,21 @@
 const std = @import("std");
-const net = std.net;
+const net = std.Io.net;
 const protocol = @import("protocol");
 
-pub fn main() !void {
-    const address = try net.Address.resolveIp("127.0.0.1", 9000);
-    const stream = try net.tcpConnectToAddress(address);
-    defer stream.close();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const address = try net.IpAddress.parse("127.0.0.1", 9000);
+    const stream = try net.IpAddress.connect(&address, io, .{ .mode = .stream });
+    defer stream.close(io);
 
-    const writer = stream.writer();
+    var write_buf: [1024]u8 = undefined;
+    var conn_writer = stream.writer(io, &write_buf);
+    const writer = &conn_writer.interface;
 
-    // Construct a Mutation Payload
-    // [TableID: u16] = 5
-    // [PK_Len: u16] = 4 ("user")
-    // [PK: user]
-    // [MutationCount: u8] = 1
-    //   [ColIdx: u8] = 0 (name)
-    //   [Op: u8] = 1 (SET)
-    //   [ValLen: u16] = 5 ("Alice")
-    //   [Val: Alice]
+    var aw = std.Io.Writer.Allocating.init(std.heap.page_allocator);
+    defer aw.deinit();
 
-    var payload_buf = std.ArrayList(u8).init(std.heap.page_allocator);
-    defer payload_buf.deinit();
-
-    const p_writer = payload_buf.writer();
+    const p_writer = &aw.writer;
     try p_writer.writeInt(u16, 5, .little);
     try p_writer.writeInt(u16, 4, .little);
     try p_writer.writeAll("user");
@@ -35,12 +28,13 @@ pub fn main() !void {
     const header = protocol.Header{
         .msg_type = .mutation,
         .stream_id = 1,
-        .payload_len = @intCast(payload_buf.items.len),
+        .payload_len = @intCast(aw.written().len),
         .sequence = 1,
     };
 
     try writer.writeAll(std.mem.asBytes(&header));
-    try writer.writeAll(payload_buf.items);
+    try writer.writeAll(aw.written());
+    try writer.flush();
 
     std.debug.print("Mutation sent: Alice -> user\n", .{});
 }

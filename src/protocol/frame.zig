@@ -8,6 +8,10 @@ pub const MessageType = enum(u8) {
     admin = 0x05,
     query_response = 0x06,
     gossip = 0x07,
+    raft_request_vote = 0x08,
+    raft_request_vote_resp = 0x09,
+    raft_append_entries = 0x0a,
+    raft_append_entries_resp = 0x0b,
 };
 
 /// The fixed-size header for all Apex protocol messages.

@@ -25,6 +25,7 @@ pub const Database = struct {
     // Oplog: A history of mutations for delta sync
     oplog: std.array_list.Managed(Mutation),
     next_seq: u64 = 1,
+    raft: ?*@import("replication/raft.zig").Raft = null,
 
     pub fn init(allocator: std.mem.Allocator, node_id: u32, io: std.Io) Database {
         return .{
@@ -37,6 +38,7 @@ pub const Database = struct {
             .version_vector = std.AutoHashMap(u32, u64).init(allocator),
             .oplog = std.array_list.Managed(Mutation).init(allocator),
             .io = io,
+            .raft = null,
         };
     }
 
@@ -162,6 +164,14 @@ pub const Database = struct {
                     });
                 }
             }
+        }
+    }
+
+    pub fn proposeMutation(self: *Database, payload: []const u8) !void {
+        if (self.raft) |r| {
+            try r.proposeMutation(payload);
+        } else {
+            try self.processMutation(payload, false);
         }
     }
 

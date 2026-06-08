@@ -45,9 +45,11 @@ pub fn main(init: std.process.Init) !void {
     const gossip_thread = try gossip_mgr.start();
     gossip_thread.detach();
 
-    var rep_manager = replication.ReplicationManager.init(allocator, &db);
-    const sync_thread = try rep_manager.start();
-    sync_thread.detach();
+    var raft_mgr = @import("replication/raft.zig").Raft.init(allocator, &db);
+    db.raft = &raft_mgr;
+    const raft_thread = try raft_mgr.start();
+    raft_thread.detach();
+    defer raft_mgr.deinit();
 
     var janitor = @import("storage/janitor.zig").Janitor.init(&db);
     const janitor_thread = try janitor.start();
@@ -87,11 +89,53 @@ fn handleConnection(allocator: std.mem.Allocator, db: *db_mod.Database, gossip_m
         try reader.readSliceAll(payload);
 
         if (header.msg_type == .mutation) {
-            try db.processMutation(payload, false);
+            try db.proposeMutation(payload);
         } else if (header.msg_type == .sync) {
             try db.processMutation(payload, true);
         } else if (header.msg_type == .gossip) {
             try gossip_mgr.handleGossip(payload);
+        } else if (header.msg_type == .raft_request_vote) {
+            if (db.raft) |r| {
+                const response = try r.handleRequestVote(payload);
+                defer allocator.free(response);
+                const resp_header = protocol.Header{
+                    .msg_type = .raft_request_vote_resp,
+                    .stream_id = header.stream_id,
+                    .payload_len = @intCast(response.len),
+                    .sequence = header.sequence,
+                };
+                var write_buf: [1024]u8 = undefined;
+                var conn_writer = conn.writer(io, &write_buf);
+                const writer = &conn_writer.interface;
+                try writer.writeAll(std.mem.asBytes(&resp_header));
+                try writer.writeAll(response);
+                try writer.flush();
+            }
+        } else if (header.msg_type == .raft_request_vote_resp) {
+            if (db.raft) |r| {
+                try r.handleRequestVoteResp(payload);
+            }
+        } else if (header.msg_type == .raft_append_entries) {
+            if (db.raft) |r| {
+                const response = try r.handleAppendEntries(payload);
+                defer allocator.free(response);
+                const resp_header = protocol.Header{
+                    .msg_type = .raft_append_entries_resp,
+                    .stream_id = header.stream_id,
+                    .payload_len = @intCast(response.len),
+                    .sequence = header.sequence,
+                };
+                var write_buf: [1024]u8 = undefined;
+                var conn_writer = conn.writer(io, &write_buf);
+                const writer = &conn_writer.interface;
+                try writer.writeAll(std.mem.asBytes(&resp_header));
+                try writer.writeAll(response);
+                try writer.flush();
+            }
+        } else if (header.msg_type == .raft_append_entries_resp) {
+            if (db.raft) |r| {
+                try r.handleAppendEntriesResp(payload);
+            }
         } else if (header.msg_type == .admin) {
             // Admin payload for schema submission: [TableID: u16][SQL: Bytes]
             var p_reader = std.Io.Reader.fixed(payload);
